@@ -20,14 +20,15 @@ const MAX_CHUNK_BYTES = 512
 // A 15-second timeout surfaces a clear error if WASM fails to load.
 async function compilePython(pythonCode) {
   const compilePromise = import('@pybricks/mpy-cross-v6').then(
-    ({ compile }) => compile('user_program.py', pythonCode)
+    ({ compile }) => compile(
+      'user_program.py',
+      pythonCode,
+      undefined,
+      '/mpy-cross-v6.wasm'   // ← tell it exactly where the file is
+    )
   )
   const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(
-      'Compilation timed out after 15 s. ' +
-      'The WebAssembly file may not have loaded. ' +
-      'Check your browser console for more details.'
-    )), 15000)
+    setTimeout(() => reject(new Error('Compilation timed out after 15 s.')), 15000)
   )
   return Promise.race([compilePromise, timeoutPromise])
 }
