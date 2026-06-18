@@ -47,10 +47,14 @@ export default function App() {
   if (!session) return <AuthPage />
 
   // Logged in but no level chosen → show level picker
-  if (!student?.selected_level)
-    return <LevelSelect student={student}
-             onSelect={lv => setStudent({ ...student, selected_level: lv })} />
+  if (!student)
+    return <div className='min-h-screen bg-gray-50 flex items-center justify-center'>
+    <p className='text-sm text-gray-400'>Setting up your account...</p>
+    </div>
 
+  if (!student.selected_level)
+    return <LevelSelect student={student}
+           onSelect={lv => setStudent({ ...student, selected_level: lv })} />
   // Fully logged in → show the main app
   return (
     <div className='flex h-screen bg-gray-50'>
