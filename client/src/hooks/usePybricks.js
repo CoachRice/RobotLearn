@@ -184,7 +184,7 @@ export function usePybricks() {
     // If the program still doesn't run, check the console log for
     // hub responses and try 0x01 or 0x0D instead.
     const CMD_START = 0x02
-    setStatus('running'); addOutput('▶ Running...(${CMD_START})')
+    setStatus('running'); addOutput(`▶ Running... (CMD_START: ${CMD_START})`)
     addOutput('─────────────────')
     try {
       console.log('[PyBricks] Sending START command:', CMD_START)
