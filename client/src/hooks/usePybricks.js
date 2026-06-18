@@ -35,7 +35,7 @@ const FLAG_RUNNING = 1  // user program is running
 
 // ── Commands sent to hub (first byte of each write) ──────────
 const CMD_STOP_PROGRAM     = 0x00  // stop the current user program
-const CMD_START_PROGRAM    = 0x01  // start the uploaded user program
+const CMD_START_PROGRAM    = 0x0D  // start the uploaded user program
 const CMD_WRITE_PROGRAM    = 0x06  // write a chunk of MPY bytecode to hub RAM
 // Note: newer PyBricks firmware (≥ 3.5) may use different command bytes.
 // If the hub does not respond to Run, check the firmware version and update
