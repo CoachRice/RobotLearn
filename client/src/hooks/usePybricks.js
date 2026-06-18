@@ -1,6 +1,5 @@
 // client/src/hooks/usePybricks.js
 import { useState, useCallback, useRef } from 'react'
-import { compile } from '@pybricks/mpy-cross-v6'
 
 // ── PyBricks BLE Protocol Constants ─────────────────────────
 const PYBRICKS_SERVICE_UUID = 'c5f50001-8280-46da-89f4-6d8051e4aeef'
@@ -10,26 +9,27 @@ const EVT_STATUS_REPORT = 0x00
 const EVT_WRITE_STDOUT  = 0x01
 
 const CMD_STOP_PROGRAM  = 0x00
-const CMD_START_PROGRAM = 0x0D
+const CMD_START_PROGRAM = 0x01
 const CMD_WRITE_PROGRAM = 0x06
 
 const MAX_CHUNK_BYTES = 512
 
-// ── Helper: compile with a 15-second timeout ─────────────────
-// If the WASM file fails to load, compile() hangs forever.
-// This wrapper rejects after 15 s with a useful error message.
-async function compileWithTimeout(code) {
-  const timeout = new Promise((_, reject) =>
+// ── Compile Python → MPY bytecode ────────────────────────────
+// Uses a DYNAMIC import so Vite 8 / rolldown handles the WASM
+// package at runtime rather than trying to bundle it at build time.
+// A 15-second timeout surfaces a clear error if WASM fails to load.
+async function compilePython(pythonCode) {
+  const compilePromise = import('@pybricks/mpy-cross-v6').then(
+    ({ compile }) => compile('user_program.py', pythonCode)
+  )
+  const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(
-      'Compilation timed out. ' +
-      'This usually means the WebAssembly file did not load. ' +
-      'Check that vite-plugin-wasm is installed and vite.config.js is updated.'
+      'Compilation timed out after 15 s. ' +
+      'The WebAssembly file may not have loaded. ' +
+      'Check your browser console for more details.'
     )), 15000)
   )
-  return Promise.race([
-    compile('user_program.py', code),
-    timeout,
-  ])
+  return Promise.race([compilePromise, timeoutPromise])
 }
 
 export function usePybricks() {
@@ -54,8 +54,6 @@ export function usePybricks() {
       text.split('\n').filter(l => l.length > 0).forEach(l => addOutput(l))
     }
     if (eventType === EVT_STATUS_REPORT) {
-      // Byte 1 is the status flags bitmask.
-      // Bit 0 set = user program running.
       const running = (data[1] & 0x01) !== 0
       setStatus(running ? 'running' : 'connected')
     }
@@ -148,13 +146,13 @@ export function usePybricks() {
     setOutput([])
     setErrorMsg(null)
 
-    // ── Step 1: Compile ──────────────────────────────────
+    // Step 1: Compile
     setStatus('compiling')
     addOutput('⚙ Compiling Python...')
 
     let mpy
     try {
-      mpy = await compileWithTimeout(pythonCode)
+      mpy = await compilePython(pythonCode)
       addOutput(`✓ Compiled (${mpy.length} bytes)`)
     } catch (err) {
       setStatus('error')
@@ -163,18 +161,16 @@ export function usePybricks() {
       return
     }
 
-    // ── Step 2: Upload ────────────────────────────────────
+    // Step 2: Upload
     setStatus('uploading')
     addOutput('⬆ Uploading to hub...')
 
     try {
-      // Stop any running program first
       await charRef.current.writeValueWithoutResponse(
         new Uint8Array([CMD_STOP_PROGRAM])
       )
       await new Promise(r => setTimeout(r, 300))
 
-      // Send MPY bytes in chunks
       let offset = 0
       while (offset < mpy.length) {
         const chunkSize = Math.min(MAX_CHUNK_BYTES - 5, mpy.length - offset)
@@ -196,7 +192,7 @@ export function usePybricks() {
       return
     }
 
-    // ── Step 3: Start ─────────────────────────────────────
+    // Step 3: Start
     setStatus('running')
     addOutput('▶ Running...')
     addOutput('─────────────────')
