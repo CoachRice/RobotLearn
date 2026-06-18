@@ -183,7 +183,7 @@ export function usePybricks() {
     // Try 0x02 (START in some protocol versions).
     // If the program still doesn't run, check the console log for
     // hub responses and try 0x01 or 0x0D instead.
-    const CMD_START = 0x02
+    const CMD_START = 0x01
     setStatus('running'); addOutput(`▶ Running... (CMD_START: ${CMD_START})`)
     addOutput('─────────────────')
     try {
