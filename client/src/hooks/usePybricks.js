@@ -55,9 +55,10 @@ export function usePybricks() {
     if (d[0] === EVT_STATUS_REPORT && d.length >= 5) {
       const flags   = new DataView(d.buffer).getUint32(1, true)
       const running = (flags & 0x0100) !== 0
+      addOutput(`  [PB status: 0x${flags.toString(16)} running=${running}]`)
       setStatus(running ? 'running' : 'connected')
     }
-  }, [])
+  }, [addOutput])
 
   // ── NUS TX — raw, unfiltered, immediate ───────────────────
   // No buffering, no line-splitting, no filtering.
