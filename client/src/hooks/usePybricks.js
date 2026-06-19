@@ -172,12 +172,14 @@ export function usePybricks() {
       // 3. START REPL — ensure hub is in interactive REPL
       addOutput('━━ Step 3: START_REPL ━━')
       await pbWrite(pb, [CMD_START_REPL], 'START_REPL', addOutput)
-      await delay(1200)  // wait for banner
+      addOutput('  (waiting 2.5s for banner to fully finish streaming...)')
+      await delay(2500)  // generous — let ALL banner output finish before sending anything
 
       // 4. Ctrl+A — enter raw mode
       addOutput('━━ Step 4: Enter raw mode ━━')
       await writeStdin(pb, new Uint8Array([CTRL_A]), 'CTRL_A', addOutput)
-      await delay(600)
+      addOutput('  (waiting 2s for "raw REPL" confirmation...)')
+      await delay(2000)  // generous — confirm raw mode banner before proceeding
 
       // 5. Send code
       addOutput('━━ Step 5: Send code ━━')
