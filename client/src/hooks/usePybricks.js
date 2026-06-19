@@ -178,13 +178,18 @@ export function usePybricks() {
       // Feed line-by-line, waiting for prompt between each
       const lines = pythonCode.split('\n')
       for (const rawLine of lines) {
-        const line = rawLine.replace(/\r$/, '')
+        const line    = rawLine.replace(/\r$/, '')
+        const trimmed = line.trim()
         // Generous timeout per line (covers wait() calls up to several seconds)
         const result = await sendLineAndWait(pb, line, 6000)
         if (result === null) {
           addOutput(`⚠ No response for line: ${line || '(blank)'}`)
           continue
         }
+        // Comments and blank lines never produce real output — skip them
+        // entirely rather than risk showing a mis-stripped echo.
+        if (trimmed === '' || trimmed.startsWith('#')) continue
+
         // Show any real print() output from this line
         if (result.trim().length > 0) {
           result.split('\n').filter(l => l.trim()).forEach(l => addOutput(l))
