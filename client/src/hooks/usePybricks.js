@@ -52,6 +52,16 @@ export function usePybricks() {
 
   const handlePbNotification = useCallback((event) => {
     const d = new Uint8Array(event.target.value.buffer)
+
+    // EVT_WRITE_STDOUT (0x01) — this is the OFFICIAL output channel for
+    // anything sent via WRITE_STDIN. We had stopped listening to this
+    // when we pivoted to NUS — that was the bug.
+    if (d[0] === 0x01) {
+      const text = new TextDecoder('utf-8', { fatal: false }).decode(d.slice(1))
+      const hex  = Array.from(d).map(b => b.toString(16).padStart(2,'0')).join(' ')
+      addOutput(`PB-STDOUT: [${hex}] "${text.replace(/\r/g,'\\r').replace(/\n/g,'\\n')}"`)
+    }
+
     if (d[0] === EVT_STATUS_REPORT && d.length >= 5) {
       const flags   = new DataView(d.buffer).getUint32(1, true)
       const running = (flags & 0x0100) !== 0
