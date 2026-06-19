@@ -1,47 +1,36 @@
 // client/src/hooks/usePybricks.js
-//
-// KEY DISCOVERIES from diagnostic run:
-//   1. PyBricks char props = write|notify (NOT writeWithoutResponse)
-//      → All previous writeValueWithoutResponse calls were silently dropped!
-//      → Must use writeValue (with response) for PyBricks characteristic.
-//   2. REPL output comes via NUS TX ✓
-//   3. REPL INPUT must go via WRITE_STDIN (0x06) on PyBricks char, NOT via NUS RX.
-//
+// Diagnostic: zero filtering on NUS output, explicit raw-mode reset sequence
 import { useState, useCallback, useRef } from 'react'
 
 const PYBRICKS_SERVICE_UUID      = 'c5f50001-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CHAR_UUID         = 'c5f50002-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CAPABILITIES_UUID = 'c5f50003-8280-46da-89f4-6d8051e4aeef'
 const NUS_SERVICE_UUID           = '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
-const NUS_TX_UUID                = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'  // hub→browser
+const NUS_TX_UUID                = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'
 
 const CMD_STOP_USER_PROGRAM = 0x00
 const CMD_START_REPL        = 0x02
-const CMD_WRITE_STDIN       = 0x06  // REPL input goes here, not NUS RX
+const CMD_WRITE_STDIN       = 0x06
 
+const CTRL_B = 0x02  // exit raw mode → back to friendly REPL
 const CTRL_C = 0x03  // interrupt
-const CTRL_A = 0x01  // enter MicroPython raw mode
-const CTRL_D = 0x04  // execute in raw mode
+const CTRL_A = 0x01  // enter raw mode
+const CTRL_D = 0x04  // execute (raw mode) / soft reboot (friendly mode)
 
 const EVT_STATUS_REPORT = 0x00
 
 const delay = ms => new Promise(r => setTimeout(r, ms))
 
-// ── Write to PyBricks char with response; tolerate Chrome timeouts ─
-// PyBricks char requires writeValue (no writeWithoutResponse).
-// For slow operations (RAM alloc, code compilation) Chrome may time out
-// waiting for the GATT Write Response, but the hub DID process the command.
 async function pbWrite(char, data, label, addOutput) {
   try {
     await char.writeValue(data instanceof Uint8Array ? data : new Uint8Array(data))
-    addOutput && addOutput(`  ✓ ${label}`)
+    if (addOutput) addOutput(`  ✓ sent: ${label}`)
   } catch (e) {
-    addOutput && addOutput(`  ⚠ ${label} (${e.message}) — hub may still have processed it`)
+    if (addOutput) addOutput(`  ⚠ FAILED: ${label} — ${e.message}`)
+    throw e
   }
 }
 
-// ── Send bytes to REPL stdin via WRITE_STDIN (command 0x06) ──
-// One call per chunk; max payload = max_char_size - 1 bytes.
 async function writeStdin(pbChar, bytes, label, addOutput) {
   const packet = new Uint8Array(1 + bytes.length)
   packet[0] = CMD_WRITE_STDIN
@@ -55,15 +44,14 @@ export function usePybricks() {
   const [hubName,  setHubName]  = useState(null)
   const [errorMsg, setErrorMsg] = useState(null)
 
-  const pbCharRef   = useRef(null)
-  const deviceRef   = useRef(null)
-  const maxCharRef  = useRef(512)
-  const nusBufRef   = useRef('')  // NUS TX line buffer
+  const pbCharRef  = useRef(null)
+  const deviceRef  = useRef(null)
+  const maxCharRef = useRef(512)
 
   const addOutput = useCallback(l => setOutput(prev => [...prev, l]), [])
 
   const handlePbNotification = useCallback((event) => {
-    const d     = new Uint8Array(event.target.value.buffer)
+    const d = new Uint8Array(event.target.value.buffer)
     if (d[0] === EVT_STATUS_REPORT && d.length >= 5) {
       const flags   = new DataView(d.buffer).getUint32(1, true)
       const running = (flags & 0x0100) !== 0
@@ -71,30 +59,17 @@ export function usePybricks() {
     }
   }, [])
 
-  // ── NUS TX — REPL stdout/stderr comes here ─────────────────
-  // Buffer incomplete lines so split NUS packets show as whole lines.
+  // ── NUS TX — raw, unfiltered, immediate ───────────────────
+  // No buffering, no line-splitting, no filtering.
+  // Every single notification is shown exactly as received.
   const handleNusTx = useCallback((event) => {
     const d    = new Uint8Array(event.target.value.buffer)
+    const hex  = Array.from(d).map(b => b.toString(16).padStart(2,'0')).join(' ')
     const text = new TextDecoder('utf-8', { fatal: false }).decode(d)
-    nusBufRef.current += text
-
-    const lines = nusBufRef.current.split('\n')
-    nusBufRef.current = lines.pop()  // keep trailing incomplete line
-
-    for (const raw of lines) {
-      const line = raw
-        .replace(/\r/g, '')
-        .replace(/\x04/g, '')     // EOT markers
-      // Skip REPL noise (prompts, raw mode banner)
-      if (line === '>' || line === 'OK' || line === '') continue
-      if (line.startsWith('raw REPL')) continue
-      if (line.startsWith('>>>')) continue
-      if (line.startsWith('...')) continue
-      addOutput(line)
-    }
+      .replace(/\r/g, '\\r').replace(/\n/g, '\\n')
+    addOutput(`NUS: [${hex}] "${text}"`)
   }, [addOutput])
 
-  // ── connect ───────────────────────────────────────────────
   const connect = useCallback(async () => {
     if (!navigator.bluetooth) {
       setStatus('error')
@@ -102,7 +77,6 @@ export function usePybricks() {
       return
     }
     setStatus('connecting'); setErrorMsg(null); setOutput([])
-    nusBufRef.current = ''
 
     try {
       const device = await navigator.bluetooth.requestDevice({
@@ -122,10 +96,8 @@ export function usePybricks() {
       try {
         const capChar = await pbSvc.getCharacteristic(PYBRICKS_CAPABILITIES_UUID)
         const capVal  = await capChar.readValue()
-        const cv      = new DataView(capVal.buffer)
-        maxCharRef.current = cv.getUint16(0, true)
-        const flags   = capVal.byteLength >= 6 ? cv.getUint32(2, true) : 0
-        addOutput(`✓ max_write=${maxCharRef.current}B caps=0x${flags.toString(16)}`)
+        maxCharRef.current = new DataView(capVal.buffer).getUint16(0, true)
+        addOutput(`✓ max_write=${maxCharRef.current}B`)
       } catch (e) { addOutput(`⚠ caps: ${e.message}`) }
 
       const pbChar = await pbSvc.getCharacteristic(PYBRICKS_CHAR_UUID)
@@ -133,13 +105,12 @@ export function usePybricks() {
       await pbChar.startNotifications()
       pbChar.addEventListener('characteristicvaluechanged', handlePbNotification)
 
-      // NUS TX (hub → browser) for REPL output
       try {
         const nusSvc = await server.getPrimaryService(NUS_SERVICE_UUID)
         const nusTx  = await nusSvc.getCharacteristic(NUS_TX_UUID)
         await nusTx.startNotifications()
         nusTx.addEventListener('characteristicvaluechanged', handleNusTx)
-        addOutput('✓ NUS TX connected (REPL output)')
+        addOutput('✓ NUS TX connected')
       } catch (e) { addOutput(`⚠ NUS: ${e.message}`) }
 
       setStatus('connected')
@@ -159,58 +130,61 @@ export function usePybricks() {
     if (!pbCharRef.current) return
     try {
       await pbWrite(pbCharRef.current, [CMD_STOP_USER_PROGRAM], 'STOP', addOutput)
-      // Also send Ctrl+C to interrupt any REPL operation
-      await writeStdin(pbCharRef.current, new Uint8Array([CTRL_C]), 'CTRL_C', null)
       setStatus('connected'); addOutput('⏹ Stopped.')
     } catch (e) { setStatus('error'); setErrorMsg('Stop: ' + e.message) }
   }, [addOutput])
 
-  // ── run via REPL + WRITE_STDIN ────────────────────────────
+  // ── run ───────────────────────────────────────────────────
   const run = useCallback(async (pythonCode) => {
     if (!pbCharRef.current) {
       setStatus('error'); setErrorMsg('Not connected.'); return
     }
     setOutput([]); setErrorMsg(null)
-    nusBufRef.current = ''
     setStatus('running')
-
     const pb = pbCharRef.current
 
     try {
-      // 1. Stop any running program
-      addOutput('⏹ Stopping...')
-      await pbWrite(pb, [CMD_STOP_USER_PROGRAM], 'STOP', null)
-      await delay(600)
-
-      // 2. Enter REPL mode
-      addOutput('▶ Starting REPL...')
-      await pbWrite(pb, [CMD_START_REPL], 'START_REPL', null)
-      await delay(1000)  // wait for REPL banner to appear
-
-      // 3. Ctrl+A: enter MicroPython raw mode via WRITE_STDIN
-      //    Hub responds with "raw REPL; CTRL-B to exit" via NUS TX
-      addOutput('  Entering raw mode (WRITE_STDIN)...')
-      await writeStdin(pb, new Uint8Array([CTRL_A]), 'CTRL_A', null)
+      // 1. STOP — interrupt any running user program
+      addOutput('━━ Step 1: STOP ━━')
+      await pbWrite(pb, [CMD_STOP_USER_PROGRAM], 'STOP', addOutput)
       await delay(500)
 
-      // 4. Send Python source code via WRITE_STDIN
-      //    max payload = maxCharRef.current - 1 bytes per call
-      const codeBytes  = new TextEncoder().encode(pythonCode)
-      const maxPayload = maxCharRef.current - 1  // 511 bytes
+      // 2. RESET REPL STATE — exit any stuck raw mode, then interrupt
+      //    This handles the hub being left in an unknown REPL state
+      //    from a previous attempt.
+      addOutput('━━ Step 2: Reset REPL state ━━')
+      await writeStdin(pb, new Uint8Array([CTRL_B]), 'CTRL_B (exit raw mode)', addOutput)
+      await delay(300)
+      await writeStdin(pb, new Uint8Array([CTRL_C]), 'CTRL_C (interrupt)', addOutput)
+      await delay(300)
 
-      addOutput(`  Sending ${codeBytes.length}B Python source...`)
+      // 3. START REPL — ensure hub is in interactive REPL
+      addOutput('━━ Step 3: START_REPL ━━')
+      await pbWrite(pb, [CMD_START_REPL], 'START_REPL', addOutput)
+      await delay(1200)  // wait for banner
+
+      // 4. Ctrl+A — enter raw mode
+      addOutput('━━ Step 4: Enter raw mode ━━')
+      await writeStdin(pb, new Uint8Array([CTRL_A]), 'CTRL_A', addOutput)
+      await delay(600)
+
+      // 5. Send code
+      addOutput('━━ Step 5: Send code ━━')
+      const codeBytes  = new TextEncoder().encode(pythonCode)
+      const maxPayload = maxCharRef.current - 1
+      let chunkNum = 0
       for (let off = 0; off < codeBytes.length; off += maxPayload) {
         const chunk = codeBytes.slice(off, off + maxPayload)
-        await writeStdin(pb, chunk, `code[${off}]`, null)
-        await delay(50)
+        chunkNum++
+        await writeStdin(pb, chunk, `code chunk ${chunkNum} (${chunk.length}B)`, addOutput)
+        await delay(60)
       }
 
-      // 5. Ctrl+D: execute the buffered code
-      //    Hub compiles + runs; output arrives via NUS TX
-      addOutput('─────────────────')
-      await writeStdin(pb, new Uint8Array([CTRL_D]), 'CTRL_D (execute)', null)
+      // 6. Ctrl+D — execute
+      addOutput('━━ Step 6: Execute (CTRL_D) ━━')
+      await writeStdin(pb, new Uint8Array([CTRL_D]), 'CTRL_D', addOutput)
 
-      // Status will update to 'connected' when program finishes
+      addOutput('━━ Waiting for hub response... ━━')
     } catch (e) {
       setStatus('error'); setErrorMsg('Run: ' + e.message)
       addOutput('✗ ' + e.message)
