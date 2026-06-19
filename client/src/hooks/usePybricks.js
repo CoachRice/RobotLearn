@@ -1,56 +1,41 @@
 // client/src/hooks/usePybricks.js
-// Blob format confirmed from hub flash dump (pybricks discussion #1567):
-//   hub.system.storage(PROGRAM_START + 4, read=61) returned:
-//   b'0\x00\x00\x00__main__\x00M\x06...'
-//   Byte 0 of blob: mpy_size uint32 LE  (0x30 = 48 for that Hello World)
-//   Byte 4+: __main__\0 (null-terminated name)
-//   Byte 13+: mpy bytes starting with M\x06 magic
-//   The 4 bytes at PROGRAM_START+0 (not shown) are filled by the hub after upload.
+// Uses the PyBricks REPL (HAS_REPL capability) to run code directly,
+// bypassing the compile-and-upload protocol entirely.
+// The hub compiles Python source itself; we just send text via WRITE_STDIN.
 import { useState, useCallback, useRef } from 'react'
 
 const PYBRICKS_SERVICE_UUID      = 'c5f50001-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CHAR_UUID         = 'c5f50002-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CAPABILITIES_UUID = 'c5f50003-8280-46da-89f4-6d8051e4aeef'
 
-const CMD_STOP_USER_PROGRAM       = 0x00
-const CMD_START_USER_PROGRAM      = 0x01
-const CMD_WRITE_USER_PROGRAM_META = 0x03
-const CMD_WRITE_USER_RAM          = 0x04
+// Commands
+const CMD_STOP_USER_PROGRAM  = 0x00  // stop any running program
+const CMD_START_REPL         = 0x02  // enter interactive REPL
+const CMD_WRITE_STDIN        = 0x06  // write bytes to REPL stdin
 
+// MicroPython raw-REPL control bytes
+const CTRL_C = 0x03   // interrupt
+const CTRL_A = 0x01   // enter raw mode
+const CTRL_D = 0x04   // execute (raw mode) / soft-reboot
+
+// Events
 const EVT_STATUS_REPORT = 0x00
 const EVT_WRITE_STDOUT  = 0x01
 
-// ── Blob format: [mpy_size uint32 LE][name\0][mpy bytes] ──────
-// Total = 4 + len(name) + 1 + mpy.length = mpy.length + 13 bytes
-function createBlob(mpy) {
-  const nameBytes = new TextEncoder().encode('__main__')  // 8 bytes
-  const blob      = new Uint8Array(4 + nameBytes.length + 1 + mpy.length)
-  const dv        = new DataView(blob.buffer)
-  let   off       = 0
-
-  dv.setUint32(off, mpy.length, true)   // mpy_size uint32 LE
-  off += 4
-  blob.set(nameBytes, off)              // '__main__'
-  off += nameBytes.length
-  blob[off++] = 0                       // null terminator
-  blob.set(mpy, off)                    // .mpy bytecode
-  return blob
-}
-
-async function compilePython(code) {
-  const p = import('@pybricks/mpy-cross-v6').then(async ({ compile }) => {
-    const r = await compile('__main__.py', code, undefined, '/mpy-cross-v6.wasm')
-    if (r instanceof Uint8Array)         return r
-    if (r?.mpy instanceof Uint8Array)    return r.mpy
-    if (r?.output instanceof Uint8Array) return r.output
-    throw new Error('Unexpected compile result: ' + JSON.stringify(Object.keys(r || {})))
-  })
-  const t = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error('Compilation timed out')), 15000))
-  return Promise.race([p, t])
-}
-
 const delay = ms => new Promise(r => setTimeout(r, ms))
+
+// ── Send bytes to hub stdin via WRITE_STDIN command ──────────
+// Splits into chunks if necessary (max write size from capabilities)
+async function writeStdin(char, bytes, maxPayload) {
+  for (let off = 0; off < bytes.length; off += maxPayload) {
+    const chunk  = bytes.slice(off, off + maxPayload)
+    const packet = new Uint8Array(1 + chunk.length)
+    packet[0] = CMD_WRITE_STDIN
+    packet.set(chunk, 1)
+    await char.writeValueWithoutResponse(packet)
+    await delay(40)
+  }
+}
 
 export function usePybricks() {
   const [status,   setStatus]   = useState('disconnected')
@@ -58,8 +43,8 @@ export function usePybricks() {
   const [hubName,  setHubName]  = useState(null)
   const [errorMsg, setErrorMsg] = useState(null)
 
-  const charRef   = useRef(null)
-  const deviceRef = useRef(null)
+  const charRef    = useRef(null)
+  const deviceRef  = useRef(null)
   const maxCharRef = useRef(512)
 
   const addOutput = useCallback(l => setOutput(prev => [...prev, l]), [])
@@ -68,7 +53,13 @@ export function usePybricks() {
     const d = new Uint8Array(event.target.value.buffer)
     if (d[0] === EVT_WRITE_STDOUT) {
       const text = new TextDecoder().decode(d.slice(1))
-      text.split('\n').filter(l => l.length > 0).forEach(l => addOutput(l))
+      // filter out MicroPython raw-REPL control sequences and echo
+      const clean = text
+        .replace(/\x04/g, '')           // Ctrl+D echo
+        .replace(/raw REPL.*\r\n/g, '') // raw mode banner
+        .replace(/^>+/gm, '')           // REPL prompt
+        .replace(/\r/g, '')             // carriage returns
+      clean.split('\n').filter(l => l.length > 0).forEach(l => addOutput(l))
     }
     if (d[0] === EVT_STATUS_REPORT && d.length >= 5) {
       const flags   = new DataView(d.buffer).getUint32(1, true)
@@ -77,6 +68,7 @@ export function usePybricks() {
     }
   }, [addOutput])
 
+  // ── connect ───────────────────────────────────────────────
   const connect = useCallback(async () => {
     if (!navigator.bluetooth) {
       setStatus('error')
@@ -105,9 +97,10 @@ export function usePybricks() {
         maxCharRef.current = cv.getUint16(0, true)
         const flags   = capVal.byteLength >= 6  ? cv.getUint32(2, true) : 0
         const maxProg = capVal.byteLength >= 10 ? cv.getUint32(6, true) : 0
-        addOutput(`✓ max_write:${maxCharRef.current}B | max_prog:${maxProg}B | caps:0x${flags.toString(16)}`)
+        const hasRepl = (flags & 0x01) !== 0
+        addOutput(`✓ max_write:${maxCharRef.current}B | caps:0x${flags.toString(16)} | REPL:${hasRepl}`)
       } catch (e) {
-        addOutput(`⚠ caps unreadable: ${e.message}`)
+        addOutput(`⚠ caps: ${e.message}`)
       }
 
       const char = await service.getCharacteristic(PYBRICKS_CHAR_UUID)
@@ -130,72 +123,55 @@ export function usePybricks() {
   const stop = useCallback(async () => {
     if (!charRef.current) return
     try {
-      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_STOP_USER_PROGRAM]))
-      setStatus('connected'); addOutput('⏹ Stopped.')
+      // Send Ctrl+C via stdin to interrupt any running code
+      await writeStdin(charRef.current, new Uint8Array([CTRL_C]), maxCharRef.current - 1)
+      setStatus('connected'); addOutput('⏹ Interrupted.')
     } catch (e) { setStatus('error'); setErrorMsg('Stop: ' + e.message) }
   }, [addOutput])
 
+  // ── run via REPL ──────────────────────────────────────────
+  // Sends Python source to the hub's built-in interpreter.
+  // No compilation or blob format needed.
   const run = useCallback(async (pythonCode) => {
     if (!charRef.current) {
       setStatus('error'); setErrorMsg('Not connected.'); return
     }
     setOutput([]); setErrorMsg(null)
 
-    // Compile
-    setStatus('compiling'); addOutput('⚙ Compiling...')
-    let mpy
-    try {
-      mpy = await compilePython(pythonCode)
-      addOutput(`✓ mpy: ${mpy.length}B  first bytes: ${Array.from(mpy.slice(0,4)).map(b=>'0x'+b.toString(16)).join(' ')}`)
-    } catch (e) {
-      setStatus('error'); setErrorMsg(e.message); addOutput('✗ ' + e.message); return
-    }
+    const maxPayload = maxCharRef.current - 1  // 1 byte for WRITE_STDIN command
 
-    // Build blob: [mpy_size uint32 LE][__main__\0][mpy bytes]
-    const blob       = createBlob(mpy)
-    const maxPayload = maxCharRef.current - 5
-    addOutput(`✓ blob: ${blob.length}B  first 8 bytes: ${Array.from(blob.slice(0,8)).map(b=>'0x'+b.toString(16)).join(' ')}`)
+    setStatus('running'); addOutput('▶ Starting REPL...')
 
-    // Upload via writeValueWithoutResponse (matches pybricksdev response=False)
-    setStatus('uploading'); addOutput('⬆ Uploading...')
     try {
+      // 1. Stop any running program
       await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_STOP_USER_PROGRAM]))
-      await delay(600)
-
-      const meta = new Uint8Array(5)
-      meta[0] = CMD_WRITE_USER_PROGRAM_META
-      new DataView(meta.buffer).setUint32(1, blob.length, true)
-      await charRef.current.writeValueWithoutResponse(meta)
-      addOutput(`  META: size=${blob.length}`)
       await delay(400)
 
-      let off = 0, n = 0
-      while (off < blob.length) {
-        const size   = Math.min(maxPayload, blob.length - off)
-        const chunk  = blob.slice(off, off + size)
-        const packet = new Uint8Array(5 + size)
-        packet[0] = CMD_WRITE_USER_RAM
-        new DataView(packet.buffer).setUint32(1, off, true)
-        packet.set(chunk, 5)
-        await charRef.current.writeValueWithoutResponse(packet)
-        off += size; n++
-        await delay(100)
-      }
-      addOutput(`✓ Uploaded ${off}B in ${n} chunk${n > 1 ? 's' : ''}`)
-      await delay(300)
-    } catch (e) {
-      setStatus('error'); setErrorMsg('Upload: ' + e.message)
-      addOutput('✗ Upload error: ' + e.message); return
-    }
+      // 2. Start the REPL
+      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_START_REPL]))
+      await delay(800)  // give REPL time to initialise
 
-    // Start
-    setStatus('running'); addOutput('▶ Running...')
-    addOutput('─────────────────')
-    try {
-      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_START_USER_PROGRAM]))
+      // 3. Enter MicroPython raw mode (Ctrl+A)
+      //    Hub will echo "raw REPL; CTRL-B to exit\r\n>"
+      addOutput('  Entering raw mode...')
+      await writeStdin(charRef.current, new Uint8Array([CTRL_A]), maxPayload)
+      await delay(400)
+
+      // 4. Send the Python source code
+      const codeBytes = new TextEncoder().encode(pythonCode)
+      addOutput(`  Sending ${codeBytes.length}B of Python source...`)
+      await writeStdin(charRef.current, codeBytes, maxPayload)
+      await delay(200)
+
+      // 5. Execute with Ctrl+D
+      //    MicroPython raw mode compiles and runs on Ctrl+D
+      addOutput('  Executing...')
+      addOutput('─────────────────')
+      await writeStdin(charRef.current, new Uint8Array([CTRL_D]), maxPayload)
+
     } catch (e) {
-      setStatus('error'); setErrorMsg('Start: ' + e.message)
-      addOutput('✗ Start error: ' + e.message)
+      setStatus('error'); setErrorMsg('REPL error: ' + e.message)
+      addOutput('✗ ' + e.message)
     }
   }, [addOutput])
 
