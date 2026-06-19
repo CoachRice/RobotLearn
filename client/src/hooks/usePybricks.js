@@ -175,11 +175,17 @@ export function usePybricks() {
       addOutput('  (waiting 2.5s for banner to fully finish streaming...)')
       await delay(2500)  // generous — let ALL banner output finish before sending anything
 
-      // 4. Ctrl+A — enter raw mode
-      addOutput('━━ Step 4: Enter raw mode ━━')
-      await writeStdin(pb, new Uint8Array([CTRL_A]), 'CTRL_A', addOutput)
-      addOutput('  (waiting 2s for "raw REPL" confirmation...)')
-      await delay(2000)  // generous — confirm raw mode banner before proceeding
+      // 4. SKIP Ctrl+A — test theory that raw mode is disabled.
+      //    Instead, send ONE simple line directly to the friendly REPL,
+      //    exactly as a human typing at the >>> prompt would.
+      addOutput('━━ Step 4: Test friendly REPL (no raw mode) ━━')
+      const testLine = new TextEncoder().encode('print(123+456)\r\n')
+      await writeStdin(pb, testLine, 'print(123+456) + Enter', addOutput)
+      addOutput('  (waiting 2s for REPL to echo + execute...)')
+      await delay(2000)
+      addOutput('━━ STOPPING HERE — check above for "579" ━━')
+      setStatus('connected')
+      return
 
       // 5. Send code
       addOutput('━━ Step 5: Send code ━━')
