@@ -1,42 +1,39 @@
 // client/src/hooks/usePybricks.js
-// Protocol: https://docs.pybricks.com/projects/pybricksdev/en/latest/api/ble/pybricks.html
-// Key insight: use writeValueWithoutResponse for all commands (matches pybricksdev response=False)
-// writeValue (with response) causes Chrome to timeout waiting for hub's GATT ack on slow ops.
+// Blob format confirmed from hub flash dump (pybricks discussion #1567):
+//   hub.system.storage(PROGRAM_START + 4, read=61) returned:
+//   b'0\x00\x00\x00__main__\x00M\x06...'
+//   Byte 0 of blob: mpy_size uint32 LE  (0x30 = 48 for that Hello World)
+//   Byte 4+: __main__\0 (null-terminated name)
+//   Byte 13+: mpy bytes starting with M\x06 magic
+//   The 4 bytes at PROGRAM_START+0 (not shown) are filled by the hub after upload.
 import { useState, useCallback, useRef } from 'react'
 
 const PYBRICKS_SERVICE_UUID      = 'c5f50001-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CHAR_UUID         = 'c5f50002-8280-46da-89f4-6d8051e4aeef'
 const PYBRICKS_CAPABILITIES_UUID = 'c5f50003-8280-46da-89f4-6d8051e4aeef'
 
-// Commands (pybricksdev Command enum, protocol v1.2+)
 const CMD_STOP_USER_PROGRAM       = 0x00
 const CMD_START_USER_PROGRAM      = 0x01
-const CMD_WRITE_USER_PROGRAM_META = 0x03  // [size uint32 LE]
-const CMD_WRITE_USER_RAM          = 0x04  // [offset uint32 LE][data...]
+const CMD_WRITE_USER_PROGRAM_META = 0x03
+const CMD_WRITE_USER_RAM          = 0x04
 
 const EVT_STATUS_REPORT = 0x00
 const EVT_WRITE_STDOUT  = 0x01
 
-// ── Multi-file blob format ────────────────────────────────────
-// Derived from hub flash dump (pybricks discussion #1567):
-//   offset  0: file_count (uint32 LE) = 1
-//   offset  4: mpy_size   (uint32 LE) = byte length of the .mpy file
-//   offset  8: '__main__\0' (null-terminated, 9 bytes)
-//   offset 17: .mpy data (mpy_size bytes)
-//
-// Total = 4 + 4 + 9 + mpy.length = mpy.length + 17 bytes
+// ── Blob format: [mpy_size uint32 LE][name\0][mpy bytes] ──────
+// Total = 4 + len(name) + 1 + mpy.length = mpy.length + 13 bytes
 function createBlob(mpy) {
-  const name      = '__main__'
-  const nameBytes = new TextEncoder().encode(name)     // 8 bytes
-  const blob      = new Uint8Array(4 + 4 + nameBytes.length + 1 + mpy.length)
+  const nameBytes = new TextEncoder().encode('__main__')  // 8 bytes
+  const blob      = new Uint8Array(4 + nameBytes.length + 1 + mpy.length)
   const dv        = new DataView(blob.buffer)
   let   off       = 0
 
-  dv.setUint32(off, 1, true);           off += 4  // file_count = 1
-  dv.setUint32(off, mpy.length, true);  off += 4  // mpy_size
-  blob.set(nameBytes, off);             off += nameBytes.length
-  blob[off++] = 0                                  // null terminator for name
-  blob.set(mpy, off)                               // .mpy bytes
+  dv.setUint32(off, mpy.length, true)   // mpy_size uint32 LE
+  off += 4
+  blob.set(nameBytes, off)              // '__main__'
+  off += nameBytes.length
+  blob[off++] = 0                       // null terminator
+  blob.set(mpy, off)                    // .mpy bytecode
   return blob
 }
 
@@ -49,18 +46,11 @@ async function compilePython(code) {
     throw new Error('Unexpected compile result: ' + JSON.stringify(Object.keys(r || {})))
   })
   const t = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error('Compilation timed out after 15 s')), 15000))
+    setTimeout(() => rej(new Error('Compilation timed out')), 15000))
   return Promise.race([p, t])
 }
 
 const delay = ms => new Promise(r => setTimeout(r, ms))
-
-// ── Fire-and-forget write (no GATT ack wait) ─────────────────
-// Matches pybricksdev's response=False — avoids Chrome GATT timeout
-// on slow operations like RAM allocation (META) or multi-chunk uploads.
-async function wr(char, data) {
-  await char.writeValueWithoutResponse(data)
-}
 
 export function usePybricks() {
   const [status,   setStatus]   = useState('disconnected')
@@ -68,8 +58,8 @@ export function usePybricks() {
   const [hubName,  setHubName]  = useState(null)
   const [errorMsg, setErrorMsg] = useState(null)
 
-  const charRef    = useRef(null)
-  const deviceRef  = useRef(null)
+  const charRef   = useRef(null)
+  const deviceRef = useRef(null)
   const maxCharRef = useRef(512)
 
   const addOutput = useCallback(l => setOutput(prev => [...prev, l]), [])
@@ -87,7 +77,6 @@ export function usePybricks() {
     }
   }, [addOutput])
 
-  // ── connect ───────────────────────────────────────────────
   const connect = useCallback(async () => {
     if (!navigator.bluetooth) {
       setStatus('error')
@@ -109,17 +98,16 @@ export function usePybricks() {
       const server  = await device.gatt.connect()
       const service = await server.getPrimaryService(PYBRICKS_SERVICE_UUID)
 
-      // Read hub capabilities
       try {
         const capChar = await service.getCharacteristic(PYBRICKS_CAPABILITIES_UUID)
         const capVal  = await capChar.readValue()
         const cv      = new DataView(capVal.buffer)
         maxCharRef.current = cv.getUint16(0, true)
-        const flags   = capVal.byteLength >= 6 ? cv.getUint32(2, true) : 0
+        const flags   = capVal.byteLength >= 6  ? cv.getUint32(2, true) : 0
         const maxProg = capVal.byteLength >= 10 ? cv.getUint32(6, true) : 0
-        addOutput(`✓ Max write: ${maxCharRef.current}B | Max prog: ${maxProg}B | Caps: 0x${flags.toString(16)}`)
+        addOutput(`✓ max_write:${maxCharRef.current}B | max_prog:${maxProg}B | caps:0x${flags.toString(16)}`)
       } catch (e) {
-        addOutput(`⚠ Could not read capabilities: ${e.message}`)
+        addOutput(`⚠ caps unreadable: ${e.message}`)
       }
 
       const char = await service.getCharacteristic(PYBRICKS_CHAR_UUID)
@@ -142,49 +130,45 @@ export function usePybricks() {
   const stop = useCallback(async () => {
     if (!charRef.current) return
     try {
-      await wr(charRef.current, new Uint8Array([CMD_STOP_USER_PROGRAM]))
+      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_STOP_USER_PROGRAM]))
       setStatus('connected'); addOutput('⏹ Stopped.')
-    } catch (e) { setStatus('error'); setErrorMsg('Stop failed: ' + e.message) }
+    } catch (e) { setStatus('error'); setErrorMsg('Stop: ' + e.message) }
   }, [addOutput])
 
-  // ── run ───────────────────────────────────────────────────
   const run = useCallback(async (pythonCode) => {
     if (!charRef.current) {
       setStatus('error'); setErrorMsg('Not connected.'); return
     }
     setOutput([]); setErrorMsg(null)
 
-    // Step 1 — Compile
+    // Compile
     setStatus('compiling'); addOutput('⚙ Compiling...')
     let mpy
     try {
       mpy = await compilePython(pythonCode)
-      addOutput(`✓ mpy: ${mpy.length}B`)
+      addOutput(`✓ mpy: ${mpy.length}B  first bytes: ${Array.from(mpy.slice(0,4)).map(b=>'0x'+b.toString(16)).join(' ')}`)
     } catch (e) {
       setStatus('error'); setErrorMsg(e.message); addOutput('✗ ' + e.message); return
     }
 
-    // Step 2 — Build blob
-    // [file_count 4B][mpy_size 4B][__main__\0 9B][mpy data NB]
+    // Build blob: [mpy_size uint32 LE][__main__\0][mpy bytes]
     const blob       = createBlob(mpy)
-    const maxPayload = maxCharRef.current - 5  // 5B = cmd(1) + offset(4)
-    addOutput(`✓ blob: ${blob.length}B (header:17 + mpy:${mpy.length}) | chunk payload: ${maxPayload}B`)
+    const maxPayload = maxCharRef.current - 5
+    addOutput(`✓ blob: ${blob.length}B  first 8 bytes: ${Array.from(blob.slice(0,8)).map(b=>'0x'+b.toString(16)).join(' ')}`)
 
-    // Step 3 — Upload via writeValueWithoutResponse (no GATT ack wait)
+    // Upload via writeValueWithoutResponse (matches pybricksdev response=False)
     setStatus('uploading'); addOutput('⬆ Uploading...')
     try {
-      // STOP
-      await wr(charRef.current, new Uint8Array([CMD_STOP_USER_PROGRAM]))
+      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_STOP_USER_PROGRAM]))
       await delay(600)
 
-      // META — tell hub total blob size so it can allocate RAM
       const meta = new Uint8Array(5)
       meta[0] = CMD_WRITE_USER_PROGRAM_META
       new DataView(meta.buffer).setUint32(1, blob.length, true)
-      await wr(charRef.current, meta)
-      await delay(400)  // give hub time to allocate RAM
+      await charRef.current.writeValueWithoutResponse(meta)
+      addOutput(`  META: size=${blob.length}`)
+      await delay(400)
 
-      // WRITE chunks
       let off = 0, n = 0
       while (off < blob.length) {
         const size   = Math.min(maxPayload, blob.length - off)
@@ -193,24 +177,24 @@ export function usePybricks() {
         packet[0] = CMD_WRITE_USER_RAM
         new DataView(packet.buffer).setUint32(1, off, true)
         packet.set(chunk, 5)
-        await wr(charRef.current, packet)
+        await charRef.current.writeValueWithoutResponse(packet)
         off += size; n++
         await delay(100)
       }
       addOutput(`✓ Uploaded ${off}B in ${n} chunk${n > 1 ? 's' : ''}`)
       await delay(300)
     } catch (e) {
-      setStatus('error'); setErrorMsg('Upload error: ' + e.message)
+      setStatus('error'); setErrorMsg('Upload: ' + e.message)
       addOutput('✗ Upload error: ' + e.message); return
     }
 
-    // Step 4 — START
+    // Start
     setStatus('running'); addOutput('▶ Running...')
     addOutput('─────────────────')
     try {
-      await wr(charRef.current, new Uint8Array([CMD_START_USER_PROGRAM]))
+      await charRef.current.writeValueWithoutResponse(new Uint8Array([CMD_START_USER_PROGRAM]))
     } catch (e) {
-      setStatus('error'); setErrorMsg('Start error: ' + e.message)
+      setStatus('error'); setErrorMsg('Start: ' + e.message)
       addOutput('✗ Start error: ' + e.message)
     }
   }, [addOutput])
