@@ -10,6 +10,12 @@ import { useState } from 'react'
 import Editor from '@monaco-editor/react'
 import { usePybricks } from '../hooks/usePybricks'
 
+// In local dev, leave VITE_API_URL unset — Vite's dev server proxies
+// /api requests to your local backend (see vite.config.js).
+// In production (Vercel), VITE_API_URL must point to your Render
+// backend URL, since the frontend and backend are on different domains.
+const API_BASE = import.meta.env.VITE_API_URL || ''
+
 const TASKS = [
   {
     slug:   'l1-build',
@@ -179,7 +185,7 @@ export default function Tasks({ student }) {
   async function submit() {
     setLoading(true); setError(null); setFeedback(null)
     try {
-      const res = await fetch('/api/feedback', {
+      const res = await fetch(`${API_BASE}/api/feedback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -198,7 +204,7 @@ export default function Tasks({ student }) {
 
   // ── Mark PDF topic as read ────────────────────────────────────
   async function markBuildComplete() {
-    await fetch('/api/feedback', {
+    await fetch(`${API_BASE}/api/feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
