@@ -39,6 +39,40 @@ app.post('/api/feedback', async (req, res) => {
       return res.status(404).json({ error: 'Task not found', detail: taskError.message });
     }
 
+    // 1b. Checklist topics (like the PDF build guide) bypass the AI entirely.
+    //     The frontend sends this exact sentinel string when a student clicks
+    //     "Mark as read" — there is no real code to review for these topics.
+    if (studentCode === 'CHECKLIST_COMPLETE') {
+      const feedback = {
+        score: 100,
+        summary: 'Checklist marked complete.',
+        issues: [],
+        strengths: [],
+        nextSteps: [],
+      };
+
+      if (studentId) {
+        await supabase.from('progress').upsert({
+          student_id: studentId, module_slug: taskSlug, status: 'completed'
+        });
+
+        const { data: nextTopic } = await supabase
+          .from('modules')
+          .select('slug')
+          .eq('level', task.level)
+          .eq('order_index', task.order_index + 1)
+          .single();
+        if (nextTopic) {
+          await supabase.from('progress').upsert({
+            student_id: studentId, module_slug: nextTopic.slug, status: 'available'
+          });
+          feedback.unlockedSlug = nextTopic.slug;
+        }
+      }
+
+      return res.json(feedback);
+    }
+
     // 2. Call the Anthropic AI with a PyBricks-specific prompt
     let message;
     try {

@@ -272,17 +272,31 @@ export default function Tasks({ student }) {
 
   // ── Mark PDF topic as read ────────────────────────────────────
   async function markBuildComplete() {
-    await fetch(`${API_BASE}/api/feedback`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentCode: 'CHECKLIST_COMPLETE',
-        taskSlug:    'l1-build',
-        studentId:   student?.id,
-      }),
-    })
-    setProgressMap(prev => ({ ...prev, 'l1-build': 'completed', 'l1-hello': 'available' }))
-    setTimeout(() => selectTask(1), 800)
+    try {
+      const res = await fetch(`${API_BASE}/api/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          studentCode: 'CHECKLIST_COMPLETE',
+          taskSlug:    'l1-build',
+          studentId:   student?.id,
+        }),
+      })
+      if (!res.ok) {
+        setError('Could not mark this topic complete. Please try again.')
+        return
+      }
+      const data = await res.json()
+      // Only update the UI once the server confirms the write succeeded
+      setProgressMap(prev => ({
+        ...prev,
+        'l1-build': 'completed',
+        ...(data.unlockedSlug ? { [data.unlockedSlug]: 'available' } : {}),
+      }))
+      setTimeout(() => selectTask(1), 800)
+    } catch {
+      setError('Could not connect to the server. Is it running?')
+    }
   }
 
   const task        = TASKS[active]
