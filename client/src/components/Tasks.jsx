@@ -169,7 +169,7 @@ export default function Tasks({ student }) {
   const [feedback,    setFeedback]    = useState(null)
   const [loading,     setLoading]     = useState(false)
   const [error,       setError]       = useState(null)
-  // progressMap: { [slug]: 'completed' | 'available' } — loaded from Supabase
+  // progressMap: { [slug]: 'complete' | 'available' } — loaded from Supabase
   // so completion state survives logout/login, instead of resetting every
   // time the page loads.
   const [progressMap, setProgressMap] = useState({})
@@ -260,7 +260,7 @@ export default function Tasks({ student }) {
       const passed = data.score >= 60  // matches default pass_threshold
       setProgressMap(prev => ({
         ...prev,
-        [TASKS[active].slug]: passed ? 'completed' : (prev[TASKS[active].slug] || 'available'),
+        [TASKS[active].slug]: passed ? 'complete' : (prev[TASKS[active].slug] || 'available'),
         ...(data.unlockedSlug ? { [data.unlockedSlug]: 'available' } : {}),
       }))
     } catch {
@@ -290,7 +290,7 @@ export default function Tasks({ student }) {
       // Only update the UI once the server confirms the write succeeded
       setProgressMap(prev => ({
         ...prev,
-        'l1-build': 'completed',
+        'l1-build': 'complete',
         ...(data.unlockedSlug ? { [data.unlockedSlug]: 'available' } : {}),
       }))
       setTimeout(() => selectTask(1), 800)
@@ -300,7 +300,7 @@ export default function Tasks({ student }) {
   }
 
   const task        = TASKS[active]
-  const isCompleted = progressMap[task.slug] === 'completed'
+  const isCompleted = progressMap[task.slug] === 'complete'
   const score       = feedback?.score ?? 0
   const scoreColor  = score >= 80 ? 'text-green-600' : score >= 60 ? 'text-amber-500' : 'text-red-500'
   const isRunning   = pybricks.status === 'running'
@@ -343,7 +343,7 @@ export default function Tasks({ student }) {
       {/* Topic tabs */}
       <div className='flex gap-2 flex-wrap mb-5'>
         {TASKS.map((t, i) => {
-          const done = progressMap[t.slug] === 'completed'
+          const done = progressMap[t.slug] === 'complete'
           return (
             <button key={i} onClick={() => selectTask(i)}
               className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${

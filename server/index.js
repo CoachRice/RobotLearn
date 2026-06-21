@@ -52,9 +52,10 @@ app.post('/api/feedback', async (req, res) => {
       };
 
       if (studentId) {
-        await supabase.from('progress').upsert({
-          student_id: studentId, module_slug: taskSlug, status: 'completed'
+        const { error: progErr } = await supabase.from('progress').upsert({
+          student_id: studentId, module_slug: taskSlug, status: 'complete'
         });
+        if (progErr) console.error('Progress upsert failed (checklist):', progErr);
 
         const { data: nextTopic } = await supabase
           .from('modules')
@@ -128,14 +129,17 @@ app.post('/api/feedback', async (req, res) => {
     if (studentId) {
       const passed = feedback.score >= task.pass_threshold;
 
-      // Always record an attempt on the current task. Mark it 'completed'
+      // Always record an attempt on the current task. Mark it 'complete'
       // only once the student actually passes — this is what lets the
       // frontend remember "Mark as read" / completion state after logout.
-      await supabase.from('progress').upsert({
+      // NOTE: the progress table's CHECK constraint only allows
+      // 'locked' | 'available' | 'in_progress' | 'complete' (no trailing 'd').
+      const { error: progErr } = await supabase.from('progress').upsert({
         student_id: studentId,
         module_slug: taskSlug,
-        status: passed ? 'completed' : 'available'
+        status: passed ? 'complete' : 'available'
       });
+      if (progErr) console.error('Progress upsert failed (current task):', progErr);
 
       if (passed) {
         const { data: nextTopic } = await supabase
