@@ -17,8 +17,10 @@ export default function Dashboard({ student }) {
     async function loadStats() {
       setLoading(true)
 
+      console.log('[Dashboard] student.selected_level:', student.selected_level, typeof student.selected_level)
+
       // ── Modules done — completed topics within the student's own level ──
-      const [{ data: levelModules }, { data: progressRows }] = await Promise.all([
+      const [modulesRes, progressRes] = await Promise.all([
         supabase
           .from('modules')
           .select('slug')
@@ -28,6 +30,12 @@ export default function Dashboard({ student }) {
           .select('module_slug, status')
           .eq('student_id', student.id),
       ])
+
+      console.log('[Dashboard] modulesRes:', modulesRes)
+      console.log('[Dashboard] progressRes:', progressRes)
+
+      const levelModules = modulesRes.data
+      const progressRows = progressRes.data
 
       const levelSlugs  = new Set((levelModules || []).map(m => m.slug))
       const modulesDone = (progressRows || [])
