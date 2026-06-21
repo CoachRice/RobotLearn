@@ -161,6 +161,9 @@ function StatusPill({ status }) {
   )
 }
 
+// Must match the server's COOLDOWN_MS in server/index.js
+const COOLDOWN_MS = 2 * 60 * 1000 // 2 minutes
+
 // ── Main Tasks component ──────────────────────────────────────
 export default function Tasks({ student }) {
   const [active,      setActive]      = useState(0)
@@ -174,9 +177,20 @@ export default function Tasks({ student }) {
   // time the page loads.
   const [progressMap, setProgressMap] = useState({})
   const [codeLoading, setCodeLoading] = useState(false)
+  // cooldownMap: { [slug]: timestampMs } — when the last submission for
+  // each topic happened, so the 2-minute cooldown survives switching tabs
+  // or logging back in (it's seeded from submitted_at in Supabase).
+  const [cooldownMap, setCooldownMap] = useState({})
+  // Ticks once per second purely to re-render the countdown display.
+  const [, forceTick] = useState(0)
 
   // PyBricks BLE hook — shared across all topics
   const pybricks = usePybricks()
+
+  useEffect(() => {
+    const id = setInterval(() => forceTick(t => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
 
   // ── Load this student's progress once on mount ───────────────
   useEffect(() => {
@@ -195,16 +209,21 @@ export default function Tasks({ student }) {
 
   // ── Fetch the student's most recent submission for a task ────
   // Falls back to the starter code if nothing was submitted yet.
+  // Also seeds cooldownMap from submitted_at so the cooldown is correct
+  // even right after logging back in.
   async function loadSavedCode(slug, fallback) {
     if (!student?.id) return fallback
     const { data } = await supabase
       .from('submissions')
-      .select('code')
+      .select('code, submitted_at')
       .eq('student_id', student.id)
       .eq('module_slug', slug)
       .order('submitted_at', { ascending: false })
       .limit(1)
       .maybeSingle()
+    if (data?.submitted_at) {
+      setCooldownMap(prev => ({ ...prev, [slug]: new Date(data.submitted_at).getTime() }))
+    }
     return data?.code ?? fallback
   }
 
@@ -238,11 +257,24 @@ export default function Tasks({ student }) {
           studentId:   student?.id,
         }),
       })
+
+      // Server enforced the cooldown — sync our local timer to match exactly.
+      if (res.status === 429) {
+        const data = await res.json()
+        setError(data.message)
+        setCooldownMap(prev => ({
+          ...prev,
+          [TASKS[active].slug]: Date.now() - (COOLDOWN_MS - data.remainingSeconds * 1000),
+        }))
+        return
+      }
+
       const data = await res.json()
       setFeedback(data)
 
-      // Save the submission so the code editor can restore it later
-      if (student?.id) {
+      // Cached results (identical code as last time) didn't call the AI,
+      // so there's nothing new to save — avoids a pointless duplicate row.
+      if (student?.id && !data.cached) {
         await fetch(`${API_BASE}/api/submissions`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -254,6 +286,9 @@ export default function Tasks({ student }) {
           }),
         })
       }
+
+      // Start (or restart) the 2-minute cooldown for this topic
+      setCooldownMap(prev => ({ ...prev, [TASKS[active].slug]: Date.now() }))
 
       // Update local progress map immediately so the UI reflects
       // completion without needing a page reload.
@@ -306,6 +341,12 @@ export default function Tasks({ student }) {
   const isRunning   = pybricks.status === 'running'
   const canRun      = ['connected', 'running', 'compiling', 'uploading'].includes(pybricks.status)
                       && !isRunning
+
+  // Seconds left before this topic's submit cooldown expires (0 if none active)
+  const lastSubmitAt    = cooldownMap[task.slug]
+  const secondsRemaining = lastSubmitAt
+    ? Math.max(0, Math.ceil((lastSubmitAt + COOLDOWN_MS - Date.now()) / 1000))
+    : 0
 
   return (
     <div>
@@ -558,10 +599,15 @@ export default function Tasks({ student }) {
                 )}
 
                 {/* Submit for AI feedback */}
-                <button onClick={submit} disabled={loading}
+                <button onClick={submit} disabled={loading || secondsRemaining > 0}
+                  title={secondsRemaining > 0
+                    ? `Please wait ${secondsRemaining}s before submitting again`
+                    : undefined}
                   className='bg-green-600 text-white px-5 py-2 rounded-lg text-sm
                              font-medium hover:bg-green-700 disabled:opacity-50'>
-                  {loading ? 'Analysing…' : 'Submit for AI feedback'}
+                  {loading ? 'Analysing…'
+                    : secondsRemaining > 0 ? `Wait ${secondsRemaining}s`
+                    : 'Submit for AI feedback'}
                 </button>
               </div>
 

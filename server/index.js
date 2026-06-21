@@ -74,6 +74,41 @@ app.post('/api/feedback', async (req, res) => {
       return res.json(feedback);
     }
 
+    // 1c. Rate-limit + duplicate-code check — protects API budget.
+    //   - Cooldown: a student can submit real code at most once every 2 min.
+    //   - Dedup: if the code is byte-for-byte identical to their last
+    //     submission, return that same feedback again without paying for
+    //     another AI call.
+    const COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+    if (studentId) {
+      const { data: lastSub } = await supabase
+        .from('submissions')
+        .select('code, ai_feedback, submitted_at')
+        .eq('student_id', studentId)
+        .eq('module_slug', taskSlug)
+        .order('submitted_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (lastSub) {
+        const elapsedMs = Date.now() - new Date(lastSub.submitted_at).getTime();
+
+        if (elapsedMs < COOLDOWN_MS) {
+          const remainingSeconds = Math.ceil((COOLDOWN_MS - elapsedMs) / 1000);
+          return res.status(429).json({
+            error: 'cooldown',
+            message: `Please wait ${remainingSeconds}s before submitting again.`,
+            remainingSeconds,
+          });
+        }
+
+        if (lastSub.code.trim() === studentCode.trim()) {
+          // Same code as last time — return identical feedback, no AI call.
+          return res.json({ ...lastSub.ai_feedback, cached: true });
+        }
+      }
+    }
+
     // 2. Call the Anthropic AI with a PyBricks-specific prompt
     let message;
     try {
