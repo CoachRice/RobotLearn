@@ -6,9 +6,10 @@
 //   • Live output console showing print() results
 //   • AI feedback submit button (unchanged)
 // ─────────────────────────────────────────────────────────────
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Editor from '@monaco-editor/react'
 import { usePybricks } from '../hooks/usePybricks'
+import { supabase } from '../supabaseClient'
 
 // In local dev, leave VITE_API_URL unset — Vite's dev server proxies
 // /api requests to your local backend (see vite.config.js).
@@ -162,23 +163,66 @@ function StatusPill({ status }) {
 
 // ── Main Tasks component ──────────────────────────────────────
 export default function Tasks({ student }) {
-  const [active,    setActive]   = useState(0)
-  const [tab,       setTab]      = useState('learn')
-  const [code,      setCode]     = useState(TASKS[1].starter)
-  const [feedback,  setFeedback] = useState(null)
-  const [loading,   setLoading]  = useState(false)
-  const [error,     setError]    = useState(null)
-  const [buildDone, setBuildDone] = useState(false)
+  const [active,      setActive]      = useState(0)
+  const [tab,         setTab]         = useState('learn')
+  const [code,        setCode]        = useState(TASKS[1].starter)
+  const [feedback,    setFeedback]    = useState(null)
+  const [loading,     setLoading]     = useState(false)
+  const [error,       setError]       = useState(null)
+  // progressMap: { [slug]: 'completed' | 'available' } — loaded from Supabase
+  // so completion state survives logout/login, instead of resetting every
+  // time the page loads.
+  const [progressMap, setProgressMap] = useState({})
+  const [codeLoading, setCodeLoading] = useState(false)
 
   // PyBricks BLE hook — shared across all topics
   const pybricks = usePybricks()
 
-  function selectTask(i) {
+  // ── Load this student's progress once on mount ───────────────
+  useEffect(() => {
+    if (!student?.id) return
+    supabase
+      .from('progress')
+      .select('module_slug, status')
+      .eq('student_id', student.id)
+      .then(({ data, error: err }) => {
+        if (err || !data) return
+        const map = {}
+        data.forEach(row => { map[row.module_slug] = row.status })
+        setProgressMap(map)
+      })
+  }, [student?.id])
+
+  // ── Fetch the student's most recent submission for a task ────
+  // Falls back to the starter code if nothing was submitted yet.
+  async function loadSavedCode(slug, fallback) {
+    if (!student?.id) return fallback
+    const { data } = await supabase
+      .from('submissions')
+      .select('code')
+      .eq('student_id', student.id)
+      .eq('module_slug', slug)
+      .order('submitted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    return data?.code ?? fallback
+  }
+
+  async function selectTask(i) {
     setActive(i)
     setTab(TASKS[i].type === 'pdf' ? 'pdf' : 'learn')
-    setCode(TASKS[i].starter || '')
     setFeedback(null)
     setError(null)
+
+    const starter = TASKS[i].starter || ''
+    if (TASKS[i].type === 'code') {
+      setCodeLoading(true)
+      const saved = await loadSavedCode(TASKS[i].slug, starter)
+      setCode(saved)
+      setCodeLoading(false)
+    } else {
+      setCode(starter)
+    }
   }
 
   // ── Submit code to AI for feedback ───────────────────────────
@@ -194,7 +238,31 @@ export default function Tasks({ student }) {
           studentId:   student?.id,
         }),
       })
-      setFeedback(await res.json())
+      const data = await res.json()
+      setFeedback(data)
+
+      // Save the submission so the code editor can restore it later
+      if (student?.id) {
+        await fetch(`${API_BASE}/api/submissions`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            studentId:  student.id,
+            moduleSlug: TASKS[active].slug,
+            code,
+            feedback:   data,
+          }),
+        })
+      }
+
+      // Update local progress map immediately so the UI reflects
+      // completion without needing a page reload.
+      const passed = data.score >= 60  // matches default pass_threshold
+      setProgressMap(prev => ({
+        ...prev,
+        [TASKS[active].slug]: passed ? 'completed' : (prev[TASKS[active].slug] || 'available'),
+        ...(data.unlockedSlug ? { [data.unlockedSlug]: 'available' } : {}),
+      }))
     } catch {
       setError('Could not connect to the server. Is it running?')
     } finally {
@@ -213,16 +281,17 @@ export default function Tasks({ student }) {
         studentId:   student?.id,
       }),
     })
-    setBuildDone(true)
+    setProgressMap(prev => ({ ...prev, 'l1-build': 'completed', 'l1-hello': 'available' }))
     setTimeout(() => selectTask(1), 800)
   }
 
-  const task       = TASKS[active]
-  const score      = feedback?.score ?? 0
-  const scoreColor = score >= 80 ? 'text-green-600' : score >= 60 ? 'text-amber-500' : 'text-red-500'
-  const isRunning  = pybricks.status === 'running'
-  const canRun     = ['connected', 'running', 'compiling', 'uploading'].includes(pybricks.status)
-                     && !isRunning
+  const task        = TASKS[active]
+  const isCompleted = progressMap[task.slug] === 'completed'
+  const score       = feedback?.score ?? 0
+  const scoreColor  = score >= 80 ? 'text-green-600' : score >= 60 ? 'text-amber-500' : 'text-red-500'
+  const isRunning   = pybricks.status === 'running'
+  const canRun      = ['connected', 'running', 'compiling', 'uploading'].includes(pybricks.status)
+                      && !isRunning
 
   return (
     <div>
@@ -259,15 +328,19 @@ export default function Tasks({ student }) {
 
       {/* Topic tabs */}
       <div className='flex gap-2 flex-wrap mb-5'>
-        {TASKS.map((t, i) => (
-          <button key={i} onClick={() => selectTask(i)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              active === i
-                ? 'bg-green-600 text-white'
-                : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}>
-            {t.title.split('—')[0].trim()}
-          </button>
-        ))}
+        {TASKS.map((t, i) => {
+          const done = progressMap[t.slug] === 'completed'
+          return (
+            <button key={i} onClick={() => selectTask(i)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                active === i
+                  ? 'bg-green-600 text-white'
+                  : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'}`}>
+              {done && <span className={active === i ? 'text-white' : 'text-green-600'}>✓</span>}
+              {t.title.split('—')[0].trim()}
+            </button>
+          )
+        })}
       </div>
 
       {/* ── PDF topic (Build your robot) ─────────────────────── */}
@@ -290,10 +363,10 @@ export default function Tasks({ student }) {
               Open in new tab ↗
             </a>
           </p>
-          <button onClick={markBuildComplete} disabled={buildDone}
+          <button onClick={markBuildComplete} disabled={isCompleted}
             className='mt-4 bg-green-600 text-white px-5 py-2 rounded-lg
                        text-sm font-medium hover:bg-green-700 disabled:opacity-60'>
-            {buildDone ? 'Done! Opening Topic 2…' : 'Mark as read — unlock Hello Robot →'}
+            {isCompleted ? '✓ Completed' : 'Mark as read — unlock Hello Robot →'}
           </button>
         </div>
       )}
@@ -434,6 +507,9 @@ export default function Tasks({ student }) {
               )}
 
               {/* Code editor */}
+              {codeLoading && (
+                <p className='text-xs text-gray-400 mb-1'>Loading your saved code...</p>
+              )}
               <div className='rounded-xl overflow-hidden border border-gray-200 mb-3'>
                 <Editor
                   height='220px' language='python'

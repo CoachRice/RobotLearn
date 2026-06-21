@@ -20,60 +20,113 @@ app.get('/health', (req, res) => {
 
 // ── Route 2: AI Feedback + auto-unlock ───────────────────
 app.post('/api/feedback', async (req, res) => {
-  const { studentCode, taskSlug, studentId } = req.body;
+  try {
+    const { studentCode, taskSlug, studentId } = req.body;
 
-  // 1. Fetch the task spec and rubric from the database
-  const { data: task, error } = await supabase
-    .from('modules')
-    .select('title, content, rubric, pass_threshold, level, order_index')
-    .eq('slug', taskSlug)
-    .single();
-  if (error) return res.status(404).json({ error: 'Task not found' });
-
-  // 2. Call the Anthropic AI with a PyBricks-specific prompt
-  const message = await ai.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 1024,
-    system: `You are a supportive PyBricks robotics coach for youth students aged 10-16.
-      Only reference the PyBricks API (PrimeHub, Motor, DriveBase, ColorSensor).
-      Never suggest RPi.GPIO, Arduino, or non-PyBricks libraries.
-      Students in Level 1 use PyBricks Blockly — their code may be auto-generated Python.
-      This is perfectly valid; review it the same way as hand-written code.
-      Return ONLY a JSON object — no markdown, no preamble — with keys:
-        score (0-100), summary (2 sentences, encouraging),
-        issues (array of {lineNumber, problem, suggestion}),
-        strengths (array of strings),
-        nextSteps (array of max 3 strings).`,
-    messages: [{
-      role: 'user',
-      content:
-        `Task: ${task.title}\n` +
-        `Goal: ${task.content.goal}\n` +
-        `Rubric: ${JSON.stringify(task.rubric)}\n\n` +
-        `Student code:\n${studentCode}`
-    }]
-  });
-
-  // 3. Parse the AI response
-  const feedback = JSON.parse(message.content[0].text);
-
-  // 4. Auto-unlock the next topic if the student passed
-  if (studentId && feedback.score >= task.pass_threshold) {
-    const { data: nextTopic } = await supabase
-      .from('modules')
-      .select('slug')
-      .eq('level', task.level)
-      .eq('order_index', task.order_index + 1)
-      .single();
-    if (nextTopic) {
-      await supabase.from('progress').upsert({
-        student_id: studentId, module_slug: nextTopic.slug, status: 'available'
-      });
-      feedback.unlockedSlug = nextTopic.slug;
+    if (!taskSlug || !studentCode) {
+      return res.status(400).json({ error: 'Missing taskSlug or studentCode in request body' });
     }
-  }
 
-  res.json(feedback);
+    // 1. Fetch the task spec and rubric from the database
+    const { data: task, error: taskError } = await supabase
+      .from('modules')
+      .select('title, content, rubric, pass_threshold, level, order_index')
+      .eq('slug', taskSlug)
+      .single();
+
+    if (taskError) {
+      console.error('Supabase task lookup error:', taskError);
+      return res.status(404).json({ error: 'Task not found', detail: taskError.message });
+    }
+
+    // 2. Call the Anthropic AI with a PyBricks-specific prompt
+    let message;
+    try {
+      message = await ai.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1024,
+        system: `You are a supportive PyBricks robotics coach for youth students aged 10-16.
+          Only reference the PyBricks API (PrimeHub, Motor, DriveBase, ColorSensor).
+          Never suggest RPi.GPIO, Arduino, or non-PyBricks libraries.
+          Students in Level 1 use PyBricks Blockly — their code may be auto-generated Python.
+          This is perfectly valid; review it the same way as hand-written code.
+          Return ONLY a JSON object — no markdown, no preamble — with keys:
+            score (0-100), summary (2 sentences, encouraging),
+            issues (array of {lineNumber, problem, suggestion}),
+            strengths (array of strings),
+            nextSteps (array of max 3 strings).`,
+        messages: [{
+          role: 'user',
+          content:
+            `Task: ${task.title}\n` +
+            `Goal: ${task.content.goal}\n` +
+            `Rubric: ${JSON.stringify(task.rubric)}\n\n` +
+            `Student code:\n${studentCode}`
+        }]
+      });
+    } catch (anthropicErr) {
+      // This logs the EXACT reason Anthropic rejected the request —
+      // e.g. invalid API key, bad model name, malformed request.
+      console.error('Anthropic API error:', anthropicErr.status, anthropicErr.message);
+      console.error('Full error:', JSON.stringify(anthropicErr, null, 2));
+      return res.status(502).json({
+        error: 'AI service error',
+        detail: anthropicErr.message || 'Unknown Anthropic API error'
+      });
+    }
+
+    // 3. Parse the AI response
+    let feedback;
+    try {
+      // Strip markdown code fences in case the model adds them despite instructions
+      const rawText = message.content[0].text.trim()
+        .replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '');
+      feedback = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error('Failed to parse AI response as JSON:', message.content[0].text);
+      return res.status(502).json({
+        error: 'AI returned an unexpected format',
+        detail: parseErr.message
+      });
+    }
+
+    // 4. Record progress for THIS task, and auto-unlock the next one if passed
+    if (studentId) {
+      const passed = feedback.score >= task.pass_threshold;
+
+      // Always record an attempt on the current task. Mark it 'completed'
+      // only once the student actually passes — this is what lets the
+      // frontend remember "Mark as read" / completion state after logout.
+      await supabase.from('progress').upsert({
+        student_id: studentId,
+        module_slug: taskSlug,
+        status: passed ? 'completed' : 'available'
+      });
+
+      if (passed) {
+        const { data: nextTopic } = await supabase
+          .from('modules')
+          .select('slug')
+          .eq('level', task.level)
+          .eq('order_index', task.order_index + 1)
+          .single();
+        if (nextTopic) {
+          await supabase.from('progress').upsert({
+            student_id: studentId, module_slug: nextTopic.slug, status: 'available'
+          });
+          feedback.unlockedSlug = nextTopic.slug;
+        }
+      }
+    }
+
+    res.json(feedback);
+
+  } catch (err) {
+    // Catches anything unexpected so the client always gets a clear JSON error
+    // instead of a cryptic status code or a hung request.
+    console.error('Unexpected error in /api/feedback:', err);
+    res.status(500).json({ error: 'Internal server error', detail: err.message });
+  }
 });
 
 // ── Route 3: Save a submission ────────────────────────────
